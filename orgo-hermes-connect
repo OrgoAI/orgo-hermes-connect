@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""orgo-hermes-connect: give a Hermes agent on an Orgo computer a public HTTPS URL
+that Hermes Desktop can connect to (Settings -> Gateways -> Remote gateway).
+
+    orgo-hermes-connect up        # create/reuse URL, configure auth, start backend, print URL
+    orgo-hermes-connect status    # show URL, backend and auth state
+    orgo-hermes-connect url       # print just the URL
+    orgo-hermes-connect down      # stop the backend and delete the public URL
+
+Stdlib only. Idempotent: re-running `up` reuses the existing URL, OAuth client and service.
+Secrets are written to ~/.hermes/.env and never printed (except a generated dashboard
+password in --auth password mode, shown once).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+ORGO_API = os.environ.get("ORGO_API_BASE", "https://www.orgo.ai/api").rstrip("/")
+DEFAULT_PORT = 9119
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+ENV_FILE = HERMES_HOME / ".env"
+STATE_FILE = HERMES_HOME / "orgo-hermes-connect.json"
+SUPERVISOR_CONF = Path("/etc/supervisor/conf.d/hermes-serve.conf")
+SYSTEMD_UNIT = Path.home() / ".config/systemd/user/hermes-serve.service"
+PROGRAM = "hermes-serve"
+# Ports Orgo refuses to publish (the computer's own services).
+RESERVED_PORTS = {22, 3389, 8080, 9000} | set(range(5900, 6000)) | set(range(6080, 6100))
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+# ── output ──────────────────────────────────────────────────────────────────
+
+def info(msg: str) -> None:
+    print(f"  {msg}", flush=True)
+
+
+def ok(msg: str) -> None:
+    print(f"  \u2713 {msg}", flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"  ! {msg}", file=sys.stderr, flush=True)
+
+
+class Fail(Exception):
+    pass
+
+
+# ── .env handling ───────────────────────────────────────────────────────────
+
+def read_env(path: Path | None = None) -> dict[str, str]:
+    path = path or ENV_FILE
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = re.sub(r"^export\s+", "", line)
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
+def upsert_env(updates: dict[str, str | None], path: Path | None = None) -> None:
+    """Set (or with None, remove) keys in a dotenv file, preserving every other line."""
+    path = path or ENV_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text().splitlines() if path.exists() else []
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", line)
+        if m and m.group(1) in updates:
+            key = m.group(1)
+            if key in seen or updates[key] is None:
+                continue
+            out.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key, val in updates.items():
+        if key not in seen and val is not None:
+            out.append(f"{key}={val}")
+    old_umask = os.umask(0o077)
+    try:
+        tmp = path.with_suffix(".tmp-ohc")
+        tmp.write_text("\n".join(out) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        os.umask(old_umask)
+
+
+def get_secret(name: str) -> str:
+    return os.environ.get(name) or read_env().get(name, "")
+
+
+# ── state ───────────────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+# ── labels ──────────────────────────────────────────────────────────────────
+
+def sanitize_label(raw: str, suffix: str | None = None) -> str:
+    """Turn any string into a label Orgo accepts:
+    3-40 chars of [a-z0-9-], starts/ends alnum, not all digits, no '--' at
+    positions 3-4, not shaped like a computer id (8 hex chars or orgo-...)."""
+    s = re.sub(r"[^a-z0-9-]+", "-", raw.lower())
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    if s.startswith("orgo-"):
+        s = s[5:]
+    if suffix is None:
+        suffix = secrets.token_hex(2)
+    base = s[: 40 - len(suffix) - 1].strip("-") if s else ""
+    label = f"{base}-{suffix}" if base else f"hermes-{suffix}"
+    if len(label) < 3:
+        label = f"hermes-{suffix}"
+    if label[2:4] == "--":
+        label = label[:2] + "x" + label[3:]
+    if label.isdigit() or re.fullmatch(r"[0-9a-f]{8}", label):
+        label = f"h{label}"[:40]
+    return label.strip("-")
+
+
+def valid_label(label: str) -> bool:
+    return bool(
+        re.fullmatch(r"[a-z0-9][a-z0-9-]{1,38}[a-z0-9]", label)
+        and not label.isdigit()
+        and label[2:4] != "--"
+        and not re.fullmatch(r"[0-9a-f]{8}", label)
+        and not label.startswith("orgo-")
+    )
+
+
+# ── password hashing (matches Hermes plugins/dashboard_auth/basic) ──────────
+
+def hash_password(password: str) -> str:
+    n, r, p, dklen = 2**14, 8, 1, 32
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, dklen=dklen, maxmem=0)
+    return f"scrypt${n}${r}${p}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+
+# ── HTTP ────────────────────────────────────────────────────────────────────
+
+def http(method: str, url: str, *, token: str | None = None, body: dict | None = None,
+         timeout: float = 30) -> tuple[int, dict | str]:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", f"orgo-hermes-connect/{__version__}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode() or "{}"
+            code = resp.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode() or "{}"
+        code = e.code
+    except urllib.error.URLError as e:
+        return 0, str(e.reason)
+    try:
+        return code, json.loads(raw)
+    except json.JSONDecodeError:
+        return code, raw
+
+
+def api_error(resp: dict | str) -> str:
+    if isinstance(resp, dict):
+        msg = resp.get("error") or resp.get("message") or json.dumps(resp)[:300]
+        code = resp.get("code")
+        return f"{msg} ({code})" if code else str(msg)
+    return str(resp)[:300]
+
+
+# ── Orgo API key ────────────────────────────────────────────────────────────
+
+def ensure_orgo_key(interactive: bool = True) -> str:
+    key = get_secret("ORGO_API_KEY")
+    if key:
+        code, _ = http("GET", f"{ORGO_API}/workspaces", token=key)
+        if code == 200:
+            ok("Orgo API key works")
+            return key
+        warn(f"ORGO_API_KEY in {ENV_FILE} was rejected (HTTP {code}); requesting a new one")
+    if not interactive:
+        raise Fail("No working ORGO_API_KEY. Set it in ~/.hermes/.env or run without --non-interactive.")
+    # Device approval: the person approves in a browser; the key never passes through chat.
+    code, start = http("POST", f"{ORGO_API}/cli/auth/start",
+                       body={"client": "orgo-hermes-connect", "hostname": socket.gethostname()})
+    if code != 200 or not isinstance(start, dict) or "device_code" not in start:
+        raise Fail(f"Could not start Orgo device approval: {api_error(start)}")
+    print()
+    print("  Approve this computer's access to your Orgo account:")
+    print(f"    {start['verification_uri_complete']}")
+    print(f"  (confirm the code {start['user_code']} matches)\n", flush=True)
+    interval = max(1, int(start.get("interval_seconds", 2)))
+    deadline = time.time() + int(start.get("expires_in_seconds", 600))
+    while time.time() < deadline:
+        time.sleep(interval)
+        code, poll = http("POST", f"{ORGO_API}/cli/auth/poll", body={"device_code": start["device_code"]})
+        status = poll.get("status") if isinstance(poll, dict) else None
+        if status == "approved" and poll.get("api_key"):
+            upsert_env({"ORGO_API_KEY": poll["api_key"]})
+            ok(f"Orgo API key saved to {ENV_FILE}")
+            return poll["api_key"]
+        if status in ("denied", "expired"):
+            raise Fail(f"Orgo approval {status}.")
+    raise Fail("Orgo approval timed out.")
+
+
+# ── computer detection ──────────────────────────────────────────────────────
+
+def detect_computer_id(key: str, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    for name in ("ORGO_COMPUTER_ID", "COMPUTER_ID"):
+        if v := get_secret(name):
+            return v
+    # Orgo's Hermes template wires an MCP server at .../mcp/computers/<id> into config.yaml.
+    cfg = HERMES_HOME / "config.yaml"
+    if cfg.exists():
+        m = re.search(r"orgo\.ai/mcp/computers/(" + UUID_RE.pattern + ")", cfg.read_text())
+        if m:
+            return m.group(1)
+    # Fall back to matching this VM's VNC password (kernel cmdline) against the API. Compared
+    # locally, never printed.
+    try:
+        cmdline = Path("/proc/cmdline").read_text()
+        m = re.search(r"orgo\.vnc_password=(\S+)", cmdline)
+    except OSError:
+        m = None
+    if m:
+        vnc = m.group(1)
+        code, comps = http("GET", f"{ORGO_API}/computers", token=key)
+        items = comps.get("computers", comps.get("data", [])) if isinstance(comps, dict) else comps
+        for c in items or []:
+            cid = c.get("id")
+            if not cid:
+                continue
+            code, full = http("GET", f"{ORGO_API}/computers/{cid}", token=key)
+            if isinstance(full, dict) and full.get("vnc_password") == vnc:
+                return cid
+    raise Fail("Could not detect this computer's Orgo id. Pass --computer-id <uuid> "
+               "or set ORGO_COMPUTER_ID in ~/.hermes/.env.")
+
+
+# ── public URL ──────────────────────────────────────────────────────────────
+
+def list_urls(key: str, cid: str) -> dict:
+    code, resp = http("GET", f"{ORGO_API}/computers/{cid}/public-urls", token=key)
+    if code != 200 or not isinstance(resp, dict):
+        raise Fail(f"Could not list public URLs (HTTP {code}): {api_error(resp)}")
+    return resp
+
+
+def ensure_public_url(key: str, cid: str, port: int, label: str | None, computer_name: str) -> dict:
+    listing = list_urls(key, cid)
+    if not listing.get("enabled"):
+        raise Fail(f"Public URLs are not enabled for this computer: {listing.get('reason', 'unknown reason')}")
+    for u in listing.get("public_urls", []):
+        if u.get("port") == port and not u.get("disabled") and (not label or u.get("label") == label):
+            ok(f"Reusing public URL {u['url']} -> :{port}")
+            if u.get("protected"):
+                warn("This URL has an Orgo visitor password; it blocks the desktop app's API/WebSocket "
+                     "calls. Removing it (Hermes' own login still protects the backend).")
+                code, resp = http("PATCH", f"{ORGO_API}/computers/{cid}/public-urls/{u['id']}",
+                                  token=key, body={"password": None})
+                if code != 200:
+                    raise Fail(f"Could not remove the visitor password: {api_error(resp)}")
+            return u
+    attempts = [label] if label else [sanitize_label(computer_name or "hermes") for _ in range(3)]
+    last = None
+    for lab in attempts:
+        if lab and not valid_label(lab):
+            raise Fail(f"Label {lab!r} is not valid (3-40 chars a-z 0-9 -, no 'ab--', not 8 hex chars).")
+        body = {"port": port, **({"label": lab} if lab else {})}
+        code, resp = http("POST", f"{ORGO_API}/computers/{cid}/public-urls", token=key, body=body)
+        if code in (200, 201) and isinstance(resp, dict) and resp.get("url"):
+            ok(f"Created public URL {resp['url']} -> :{port}")
+            return resp
+        last = resp
+        if code == 409 and not label:  # generated name collided; try another
+            continue
+        break
+    raise Fail(f"Could not create a public URL: {api_error(last)}")
+
+
+# ── Hermes ──────────────────────────────────────────────────────────────────
+
+def hermes_bin() -> str:
+    for cand in (shutil.which("hermes"), "/usr/local/bin/hermes", str(Path.home() / ".local/bin/hermes")):
+        if cand and Path(cand).exists():
+            return cand
+    raise Fail("Hermes is not installed (no `hermes` on PATH).")
+
+
+def run(cmd: list[str], *, timeout: int = 120, check: bool = False, capture: bool = True) -> subprocess.CompletedProcess:
+    p = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
+    if check and p.returncode != 0:
+        raise Fail(f"`{' '.join(cmd[:4])} ...` failed ({p.returncode}): {(p.stderr or p.stdout)[-500:]}")
+    return p
+
+
+def nous_logged_in(hermes: str) -> bool:
+    p = run([hermes, "auth", "status", "nous"], timeout=60)
+    return "logged in" in (p.stdout + p.stderr).lower() and "logged out" not in (p.stdout + p.stderr).lower()
+
+
+def configure_auth(hermes: str, mode: str, public_url: str, args) -> dict:
+    """Configure the dashboard login provider. Returns info to print; result['changed'] says
+    whether ~/.hermes/.env changed (the backend only reads it at startup)."""
+    env = read_env()
+    result: dict = {"mode": mode}
+    callback = f"{public_url}/auth/callback"
+    if mode == "nous":
+        if not nous_logged_in(hermes):
+            if args.non_interactive:
+                raise Fail("Not signed in to Nous. Run `hermes auth add nous --type oauth --no-browser` first.")
+            info("Signing this Hermes install in to Nous Portal (needed to register the dashboard login).")
+            info("Follow the link and code below:\n")
+            p = subprocess.run([hermes, "auth", "add", "nous", "--type", "oauth", "--no-browser"], timeout=900)
+            if p.returncode != 0 or not nous_logged_in(hermes):
+                raise Fail("Nous sign-in did not complete.")
+        state = load_state()
+        already = env.get("HERMES_DASHBOARD_OAUTH_CLIENT_ID") and (
+            env.get("HERMES_DASHBOARD_PUBLIC_URL") == public_url or state.get("registered_for") == public_url)
+        if already and not args.reregister:
+            ok("Nous dashboard login already registered for this URL")
+        else:
+            name = args.name or re.sub(r"^https://|\..*$", "", public_url)
+            p = run([hermes, "dashboard", "register", "--name", name, "--redirect-uri", callback], timeout=120)
+            if p.returncode != 0:
+                raise Fail(f"`hermes dashboard register` failed: {(p.stderr or p.stdout)[-600:]}")
+            state["registered_for"] = public_url
+            save_state(state)
+            ok("Registered Nous Portal login for this URL")
+        upsert_env({"HERMES_DASHBOARD_PUBLIC_URL": public_url})
+    elif mode == "oidc":
+        if not (args.oidc_issuer and args.oidc_client_id):
+            raise Fail("--auth oidc needs --oidc-issuer and --oidc-client-id "
+                       f"(register {callback} as the client's redirect URI).")
+        upsert_env({"HERMES_DASHBOARD_OIDC_ISSUER": args.oidc_issuer,
+                    "HERMES_DASHBOARD_OIDC_CLIENT_ID": args.oidc_client_id,
+                    "HERMES_DASHBOARD_PUBLIC_URL": public_url})
+        ok(f"OIDC login configured (issuer {args.oidc_issuer}); redirect URI: {callback}")
+    elif mode == "password":
+        warn("Password login is a single shared credential. Hermes recommends it for trusted networks; "
+             "prefer --auth nous for an internet-facing URL.")
+        user = args.username or env.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME") or "admin"
+        have = env.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH") and not args.rotate_password
+        updates = {"HERMES_DASHBOARD_BASIC_AUTH_USERNAME": user, "HERMES_DASHBOARD_PUBLIC_URL": public_url}
+        if not have:
+            pw = secrets.token_urlsafe(18)
+            updates["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH"] = hash_password(pw)
+            updates["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = None  # plaintext would override the hash
+            result["password"] = pw
+        if not env.get("HERMES_DASHBOARD_BASIC_AUTH_SECRET"):
+            updates["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] = base64.b64encode(secrets.token_bytes(32)).decode()
+        upsert_env(updates)
+        result["username"] = user
+        ok("Username/password login configured" + ("" if have else " (new password generated)"))
+    else:
+        raise Fail(f"Unknown auth mode {mode!r}")
+    result["changed"] = read_env() != env
+    return result
+
+
+# ── service management ──────────────────────────────────────────────────────
+
+def service_kind() -> str:
+    if shutil.which("supervisorctl") and Path("/etc/supervisor/conf.d").is_dir() and os.geteuid() == 0:
+        p = run(["supervisorctl", "status"], timeout=20)
+        if p.returncode in (0, 3) or "RUNNING" in p.stdout:
+            return "supervisor"
+    if shutil.which("systemctl"):
+        p = run(["systemctl", "--user", "is-system-running"], timeout=20)
+        if p.stdout.strip() in ("running", "degraded", "starting"):
+            return "systemd"
+    return "nohup"
+
+
+def supervisor_conf(hermes: str, port: int) -> str:
+    return f"""; Managed by orgo-hermes-connect. Hermes backend for Hermes Desktop remote access.
+[program:{PROGRAM}]
+command={hermes} serve --host 0.0.0.0 --port {port} --skip-build
+directory={Path.home()}
+user={os.environ.get('USER', 'root')}
+environment=HOME="{Path.home()}",PATH="{Path.home()}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+autorestart=true
+startsecs=10
+stopsignal=TERM
+stopwaitsecs=30
+exitcodes=0,78
+stdout_logfile=/var/log/{PROGRAM}.log
+stderr_logfile=/var/log/{PROGRAM}.err
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
+"""
+
+
+def systemd_unit(hermes: str, port: int) -> str:
+    return f"""[Unit]
+Description=Hermes backend for Hermes Desktop (orgo-hermes-connect)
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.hermes/.env
+ExecStart={hermes} serve --host 0.0.0.0 --port {port} --skip-build
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=default.target
+"""
+
+
+MANAGED_MARK = "; Managed by orgo-hermes-connect."
+
+
+def start_backend(hermes: str, port: int, *, restart: bool, force: bool = False) -> tuple[str, str]:
+    """Make sure `hermes serve` runs on `port`. Returns (service_kind, action).
+
+    Never disrupts a healthy backend unless something it depends on changed (`restart`),
+    and never rewrites a service definition it did not create unless `force`.
+    action is one of: "unchanged", "started", "restarted", "adopted".
+    """
+    kind = service_kind()
+    if kind == "supervisor":
+        want = supervisor_conf(hermes, port)
+        existing = SUPERVISOR_CONF.read_text() if SUPERVISOR_CONF.exists() else None
+        foreign = existing is not None and MANAGED_MARK not in existing
+        if foreign and not force:
+            # Someone (or Orgo's template) already defined hermes-serve. Use it as-is.
+            m = re.search(r"--port\s+(\d+)", existing)
+            if m and int(m.group(1)) != port:
+                raise Fail(f"{SUPERVISOR_CONF} already runs hermes-serve on port {m.group(1)}; "
+                           f"use --port {m.group(1)} or --force to take it over.")
+            status = run(["supervisorctl", "status", PROGRAM], timeout=20).stdout
+            if "RUNNING" not in status:
+                run(["supervisorctl", "start", PROGRAM], timeout=90)
+                return kind, "started"
+            if restart:
+                run(["supervisorctl", "restart", PROGRAM], timeout=90)
+                return kind, "restarted"
+            return kind, "adopted"
+        changed = existing != want
+        if changed:
+            SUPERVISOR_CONF.write_text(want)
+            run(["supervisorctl", "reread"], timeout=30)
+            # `update` restarts the group when its definition changed.
+            run(["supervisorctl", "update", PROGRAM], timeout=90)
+        status = run(["supervisorctl", "status", PROGRAM], timeout=20).stdout
+        if "RUNNING" not in status:
+            run(["supervisorctl", "start", PROGRAM], timeout=90)
+            return kind, "started"
+        if changed:
+            return kind, "restarted"
+        if restart:
+            run(["supervisorctl", "restart", PROGRAM], timeout=90)
+            return kind, "restarted"
+        return kind, "unchanged"
+    if kind == "systemd":
+        want = systemd_unit(hermes, port)
+        changed = not SYSTEMD_UNIT.exists() or SYSTEMD_UNIT.read_text() != want
+        if changed:
+            SYSTEMD_UNIT.parent.mkdir(parents=True, exist_ok=True)
+            SYSTEMD_UNIT.write_text(want)
+            run(["systemctl", "--user", "daemon-reload"], timeout=30)
+        active = run(["systemctl", "--user", "is-active", "hermes-serve"], timeout=20).stdout.strip() == "active"
+        run(["systemctl", "--user", "enable", "hermes-serve"], timeout=60)
+        run(["loginctl", "enable-linger", os.environ.get("USER", "root")], timeout=20)
+        if not active:
+            run(["systemctl", "--user", "start", "hermes-serve"], timeout=60)
+            return kind, "started"
+        if changed or restart:
+            run(["systemctl", "--user", "restart", "hermes-serve"], timeout=60)
+            return kind, "restarted"
+        return kind, "unchanged"
+    warn("No supervisor or systemd found; starting in the background (won't survive reboot).")
+    if backend_status(f"http://127.0.0.1:{port}", timeout=0) and not restart:
+        return kind, "unchanged"
+    run([hermes, "serve", "--stop"], timeout=60)
+    logs = HERMES_HOME / "logs"
+    log = open(logs / "hermes-serve.log", "a") if logs.is_dir() else subprocess.DEVNULL
+    subprocess.Popen([hermes, "serve", "--host", "0.0.0.0", "--port", str(port), "--skip-build"],
+                     stdout=log, stderr=log, start_new_session=True)
+    return kind, "started"
+
+
+def stop_backend(force: bool = False) -> None:
+    kind = service_kind()
+    if kind == "supervisor" and SUPERVISOR_CONF.exists():
+        if MANAGED_MARK not in SUPERVISOR_CONF.read_text() and not force:
+            raise Fail(f"{SUPERVISOR_CONF} was not created by orgo-hermes-connect; pass --force to remove it.")
+        run(["supervisorctl", "stop", PROGRAM], timeout=60)
+        SUPERVISOR_CONF.unlink()
+        run(["supervisorctl", "reread"], timeout=30)
+        run(["supervisorctl", "update"], timeout=60)
+    elif kind == "systemd" and SYSTEMD_UNIT.exists():
+        run(["systemctl", "--user", "disable", "--now", "hermes-serve"], timeout=60)
+        SYSTEMD_UNIT.unlink()
+    else:
+        run([hermes_bin(), "serve", "--stop"], timeout=60)
+
+
+def backend_status(base: str, timeout: float = 60) -> dict | None:
+    deadline = time.time() + timeout
+    while True:
+        code, resp = http("GET", f"{base}/api/status", timeout=10)
+        if code == 200 and isinstance(resp, dict):
+            return resp
+        if time.time() >= deadline:
+            return None
+        time.sleep(3)
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_up(args) -> int:
+    if args.port in RESERVED_PORTS:
+        raise Fail(f"Port {args.port} is reserved by Orgo; pick another (default {DEFAULT_PORT}).")
+    print(f"\norgo-hermes-connect {__version__}\n")
+    hermes = hermes_bin()
+    key = ensure_orgo_key(interactive=not args.non_interactive)
+    cid = detect_computer_id(key, args.computer_id)
+    code, comp = http("GET", f"{ORGO_API}/computers/{cid}", token=key)
+    name = comp.get("name", "hermes") if isinstance(comp, dict) else "hermes"
+    ok(f"Computer: {name} ({cid})")
+
+    u = ensure_public_url(key, cid, args.port, args.label, name)
+    public_url = u["url"].rstrip("/")
+
+    auth = configure_auth(hermes, args.auth, public_url, args)
+    kind, action = start_backend(hermes, args.port, restart=auth["changed"] or args.restart, force=args.force)
+    ok({"unchanged": f"Backend already running on :{args.port} (left untouched)",
+        "adopted": f"Using existing {PROGRAM} service on :{args.port} (left untouched)",
+        "started": f"Backend started via {kind} on 0.0.0.0:{args.port}",
+        "restarted": f"Backend restarted via {kind} to pick up new settings"}[action])
+
+    local = backend_status(f"http://127.0.0.1:{args.port}", timeout=90)
+    if not local:
+        raise Fail(f"Backend did not come up on :{args.port}. Check `supervisorctl tail {PROGRAM} stderr` "
+                   "or `hermes serve --status`.")
+    remote = backend_status(public_url, timeout=60)
+    providers = (remote or local).get("auth_providers", [])
+    if not (remote or local).get("auth_required"):
+        warn("Backend reports auth_required=false; the login gate is not engaged.")
+    elif not providers:
+        warn("Auth gate engaged but no provider registered; check ~/.hermes/.env.")
+    else:
+        ok(f"Login required (providers: {', '.join(providers)})")
+    if not remote:
+        warn(f"{public_url} is not answering yet; it can take a few seconds after creation.")
+
+    state = load_state()
+    state.update({"computer_id": cid, "url_id": u["id"], "url": public_url, "port": args.port,
+                  "auth": args.auth, "service": kind, "version": __version__})
+    save_state(state)
+
+    print("\n  " + "─" * 60)
+    print(f"  Hermes Desktop gateway URL:  {public_url}")
+    print("  " + "─" * 60)
+    print("  In Hermes Desktop: Settings -> Gateways -> Remote gateway -> paste the URL -> Sign in")
+    if auth["mode"] == "nous":
+        print("  Sign in with the Nous account that registered this dashboard.")
+    elif auth["mode"] == "password":
+        print(f"  Username: {auth['username']}")
+        if auth.get("password"):
+            print(f"  Password: {auth['password']}   (shown once; stored only as a hash)")
+        else:
+            print("  Password: unchanged (use --rotate-password to generate a new one)")
+    print()
+    if args.json:
+        print(json.dumps({"url": public_url, "auth": auth["mode"], "computer_id": cid}))
+    return 0
+
+
+def cmd_status(args) -> int:
+    state = load_state()
+    url = state.get("url")
+    port = state.get("port", DEFAULT_PORT)
+    local = backend_status(f"http://127.0.0.1:{port}", timeout=0)
+    remote = backend_status(url, timeout=0) if url else None
+    data = {
+        "url": url,
+        "computer_id": state.get("computer_id"),
+        "auth_mode": state.get("auth"),
+        "service": state.get("service"),
+        "backend_local": bool(local),
+        "backend_public": bool(remote),
+        "auth_required": (remote or local or {}).get("auth_required"),
+        "auth_providers": (remote or local or {}).get("auth_providers"),
+        "hermes_version": (remote or local or {}).get("version"),
+    }
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        for k, v in data.items():
+            print(f"  {k:16} {v}")
+    healthy = data["backend_public"] and data["auth_required"] and data["auth_providers"]
+    return 0 if healthy else 1
+
+
+def cmd_url(args) -> int:
+    url = load_state().get("url")
+    if not url:
+        print("No URL yet; run `orgo-hermes-connect up`.", file=sys.stderr)
+        return 1
+    print(url)
+    return 0
+
+
+def cmd_down(args) -> int:
+    state = load_state()
+    stop_backend(force=args.force)
+    ok("Backend stopped")
+    if state.get("url_id") and not args.keep_url:
+        key = ensure_orgo_key(interactive=False)
+        code, resp = http("DELETE", f"{ORGO_API}/computers/{state['computer_id']}/public-urls/{state['url_id']}",
+                          token=key)
+        if code in (200, 204, 404):
+            ok(f"Deleted public URL {state.get('url')}")
+        else:
+            warn(f"Could not delete public URL: {api_error(resp)}")
+        for k in ("url", "url_id", "registered_for"):
+            state.pop(k, None)
+    save_state(state)
+    if state.get("auth") == "nous":
+        info("To revoke the Nous login client: https://portal.nousresearch.com/local-dashboards")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="orgo-hermes-connect", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version=__version__)
+    sub = p.add_subparsers(dest="cmd")
+
+    up = sub.add_parser("up", help="Create/reuse the URL, configure login, start the backend")
+    up.add_argument("--auth", choices=["nous", "password", "oidc"], default=os.environ.get("OHC_AUTH", "nous"),
+                    help="Login provider for the public URL (default: nous)")
+    up.add_argument("--port", type=int, default=DEFAULT_PORT)
+    up.add_argument("--label", help="URL label -> https://<label>.orgo.dev (default: <computer-name>-<4 hex>)")
+    up.add_argument("--computer-id", help="Orgo computer id (auto-detected on Orgo's Hermes template)")
+    up.add_argument("--name", help="Name for the Nous dashboard registration")
+    up.add_argument("--reregister", action="store_true", help="--auth nous: register a fresh Nous login client")
+    up.add_argument("--username", help="--auth password: username (default admin)")
+    up.add_argument("--rotate-password", action="store_true", help="--auth password: generate a new password")
+    up.add_argument("--oidc-issuer", help="--auth oidc: issuer URL")
+    up.add_argument("--oidc-client-id", help="--auth oidc: public PKCE client id")
+    up.add_argument("--non-interactive", action="store_true", help="Fail instead of prompting for approvals")
+    up.add_argument("--restart", action="store_true", help="Restart the backend even if nothing changed")
+    up.add_argument("--force", action="store_true", help="Take over a hermes-serve service this tool didn't create")
+    up.add_argument("--json", action="store_true", help="Also print a JSON summary line")
+
+    st = sub.add_parser("status", help="Show URL, backend and login state (exit 1 if unhealthy)")
+    st.add_argument("--json", action="store_true")
+    sub.add_parser("url", help="Print the gateway URL")
+    dn = sub.add_parser("down", help="Stop the backend and delete the public URL")
+    dn.add_argument("--keep-url", action="store_true", help="Stop the backend but keep the URL reserved")
+    dn.add_argument("--force", action="store_true", help="Also remove a hermes-serve service this tool didn't create")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if not args.cmd:
+        args = build_parser().parse_args(["up", *(argv or sys.argv[1:])])
+    try:
+        return {"up": cmd_up, "status": cmd_status, "url": cmd_url, "down": cmd_down}[args.cmd](args)
+    except Fail as e:
+        print(f"\n  \u2717 {e}\n", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n  Cancelled.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
