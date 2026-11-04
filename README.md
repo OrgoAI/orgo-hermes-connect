@@ -91,7 +91,7 @@ create, it uses that service as-is.
 
 - An Orgo **Linux** computer with public URLs enabled. This needs a paid plan or credits.
 - Hermes Agent installed (Orgo's Hermes template ships it).
-- Python 3.9+ and `curl`. The tool is a single stdlib-only Python file.
+- Python 3.10+ and `curl`. The tool is a single stdlib-only Python file.
 
 ## Security notes
 
