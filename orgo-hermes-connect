@@ -6,6 +6,7 @@ that Hermes Desktop can connect to (Settings -> Gateways -> Remote gateway).
     orgo-hermes-connect status    # show URL, backend and auth state
     orgo-hermes-connect url       # print just the URL
     orgo-hermes-connect down      # stop the backend and delete the public URL
+    orgo-hermes-connect up --webapp   # the same for the Hermes Webapp (Desktop in a browser)
 
 Stdlib only. Idempotent: re-running `up` reuses the existing URL, OAuth client and service.
 Secrets are written to ~/.hermes/.env and never printed (except a generated dashboard
@@ -29,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 ORGO_API = os.environ.get("ORGO_API_BASE", "https://www.orgo.ai/api").rstrip("/")
 DEFAULT_PORT = 9119
@@ -554,9 +555,308 @@ def backend_status(base: str, timeout: float = 60) -> dict | None:
         time.sleep(3)
 
 
+# ── Webapp (the Desktop workspace in a browser, Hermes >= 0.23) ─────────────
+#
+# Unlike `hermes serve` above, the Webapp is served by the Hermes *gateway* (the process that also
+# answers chat, Telegram, etc.) on its own port, from the `webapp:` block of config.yaml, read only
+# when the gateway starts. Its Nous sign-in uses a client of its own (webapp/sign-in-registration.json),
+# never HERMES_DASHBOARD_OAUTH_CLIENT_ID, so it cannot break the Desktop gateway's login.
+
+WEBAPP_PORT = 9120
+GATEWAY_PROGRAM = "hermes-gateway"
+RESTART_DELAY = 30
+# Hermes has no CLI verb that registers the Webapp's own Nous sign-in (only Desktop's Settings -> Web
+# Access does, through hermes_cli.webapp_access.register). We call that function with Hermes' own
+# interpreter and bootstrap, taken from `hermes --print-runtime-command`, by swapping its final
+# entry-point call for ours. The callback arrives in an env var, so nothing is spliced into code.
+_ENTRY_CALL = "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
+_REGISTER_CALL = ("__import__('hermes_cli.webapp_access', fromlist=['register'])"
+                  ".register(os.environ['OHC_WEBAPP_CALLBACK'])")
+
+
+def register_command(runtime_json: str) -> list[str]:
+    """Hermes' own runtime command with its entry point replaced by the Webapp sign-in registration."""
+    try:
+        cmd = json.loads(runtime_json)
+    except json.JSONDecodeError:
+        cmd = None
+    if not (isinstance(cmd, list) and len(cmd) >= 3 and cmd[-2] == "-c" and _ENTRY_CALL in cmd[-1]):
+        raise Fail("This Hermes install doesn't expose a runtime command this tool understands. Register the "
+                   "Webapp's sign-in from Hermes Desktop instead: Settings -> Web Access -> My own URL.")
+    return [*cmd[:-1], cmd[-1].replace(_ENTRY_CALL, _REGISTER_CALL)]
+
+
+def register_webapp_sign_in(hermes: str, callback: str) -> bool:
+    """Register (or update in place) the Webapp's Nous sign-in for `callback`. Returns whether the
+    registration changed; Hermes itself skips the Portal call when the callback is already registered."""
+    reg = HERMES_HOME / "webapp" / "sign-in-registration.json"
+    before = reg.read_text() if reg.exists() else None
+    p = run([hermes, "--print-runtime-command"], timeout=60)
+    cmd = register_command(p.stdout.strip().splitlines()[-1] if p.stdout.strip() else "")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "OHC_WEBAPP_CALLBACK": callback})
+    if r.returncode != 0:
+        raise Fail(f"Registering the Webapp's Nous sign-in failed: {(r.stderr or r.stdout)[-600:]}")
+    return (reg.read_text() if reg.exists() else None) != before
+
+
+def config_get(hermes: str, key: str) -> str:
+    p = run([hermes, "config", "get", key], timeout=60)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def config_list(hermes: str, key: str) -> list[str]:
+    out = config_get(hermes, key)
+    if out in ("", "[]"):
+        return []
+    return [line.strip()[1:].strip().strip("'\"") for line in out.splitlines() if line.strip().startswith("-")]
+
+
+def config_set(hermes: str, key: str, value: str, current: str) -> bool:
+    """Set `key` through `hermes config set` (never by editing config.yaml) when it differs."""
+    if current == value:
+        return False
+    run([hermes, "config", "set", key, value], timeout=60, check=True)
+    return True
+
+
+def merge_proxies(current: list[str], seen: set[str]) -> list[str]:
+    """Add the proxy addresses we saw to the trusted list, keeping every existing entry."""
+    out = list(current)
+    for ip in sorted(seen):
+        if ip not in out:
+            out.append(ip)
+    return out
+
+
+def _non_loopback(ip: str) -> bool:
+    import ipaddress
+    try:
+        return not ipaddress.ip_address(ip).is_loopback
+    except ValueError:
+        return False
+
+
+def established_peers(port: int) -> set[str]:
+    """Remote addresses with an open connection to local `port` (Orgo's edge proxy, for a public URL)."""
+    p = run(["ss", "-tnH", "state", "established", f"( sport = :{port} )"], timeout=20)
+    peers = set()
+    for line in p.stdout.splitlines():
+        cols = line.split()
+        if len(cols) >= 4:
+            peers.add(cols[3].rsplit(":", 1)[0].strip("[]"))
+    return {ip for ip in peers if _non_loopback(ip)}
+
+
+def probe_proxy(public_url: str, port: int, timeout: float = 15) -> set[str]:
+    """Find the address Orgo's proxy reaches `port` from. When the port is free, listen on it briefly and
+    request the public URL; when something already serves it, look at its open connections."""
+    import threading
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", port))
+    except OSError:
+        http("GET", public_url, timeout=timeout)  # opens (or reuses) a proxy connection to the server
+        return established_peers(port)
+    seen: set[str] = set()
+    with srv:
+        srv.listen(4)
+        srv.settimeout(timeout)
+        threading.Thread(target=http, args=("GET", public_url), kwargs={"timeout": timeout}, daemon=True).start()
+        try:
+            conn, addr = srv.accept()
+            with conn:
+                seen.add(addr[0])
+                conn.sendall(b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+        except OSError:
+            pass
+    return {ip for ip in seen if _non_loopback(ip)}
+
+
+def webapp_serving(hermes: str) -> bool:
+    return run([hermes, "webapp", "--status"], timeout=60).stdout.strip().startswith("Serving at")
+
+
+def inside_agent() -> bool:
+    """True when this runs from a Hermes agent's own terminal, i.e. as a child of the gateway: restarting
+    the gateway right away would end the agent's turn (and this command) mid-way."""
+    return bool(os.environ.get("HERMES_SESSION_ID") or os.environ.get("HERMES_AGENT"))
+
+
+def restart_gateway(hermes: str, *, defer: bool, delay: int = RESTART_DELAY) -> str:
+    """Restart the gateway so it reads the `webapp:` config. With `defer`, schedule it `delay` seconds out
+    in a session of its own (it outlives the gateway's process group) and return at once.
+    Returns "restarted" or "scheduled"."""
+    status = run(["supervisorctl", "status", GATEWAY_PROGRAM], timeout=20) if shutil.which("supervisorctl") else None
+    if status is not None and GATEWAY_PROGRAM in status.stdout and "no such process" not in status.stdout.lower():
+        cmd = ["supervisorctl", "restart", GATEWAY_PROGRAM]
+    else:
+        cmd = [hermes, "gateway", "restart", "--detach"]
+    if defer:
+        import shlex
+        subprocess.Popen(["sh", "-c", f"sleep {int(delay)}; exec {shlex.join(cmd)}"], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "scheduled"
+    p = run(cmd, timeout=180)
+    if p.returncode != 0:
+        raise Fail(f"Gateway restart failed: {(p.stderr or p.stdout)[-500:]}")
+    return "restarted"
+
+
+def public_sign_in_check(url: str, timeout: float = 15) -> tuple[int, str]:
+    """(status, Location) for GET `url` without following redirects."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None
+    req = urllib.request.Request(url, headers={"User-Agent": f"orgo-hermes-connect/{__version__}"})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as resp:
+            return resp.status, resp.headers.get("Location", "")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location", "")
+    except (urllib.error.URLError, OSError) as e:
+        return 0, str(e)
+
+
+def sign_in_gated(code: int, location: str) -> bool:
+    return code == 401 or (code in (302, 303, 307) and "/auth/login" in location)
+
+
+def cmd_web_up(args) -> int:
+    port = args.port or WEBAPP_PORT
+    if port in RESERVED_PORTS:
+        raise Fail(f"Port {port} is reserved by Orgo; pick another (default {WEBAPP_PORT}).")
+    print(f"\norgo-hermes-connect {__version__}: Webapp\n")
+    hermes = hermes_bin()
+    if run([hermes, "webapp", "--help"], timeout=60).returncode != 0:
+        raise Fail("This Hermes has no Webapp (needs Hermes 0.23+). Run `hermes update` first.")
+    if not nous_logged_in(hermes):
+        raise Fail("The Webapp's sign-in needs this Hermes signed in to Nous: "
+                   "run `hermes auth add nous --type oauth --no-browser` first.")
+    key = ensure_orgo_key(interactive=not args.non_interactive)
+    cid = detect_computer_id(key, args.computer_id)
+    code, comp = http("GET", f"{ORGO_API}/computers/{cid}", token=key)
+    name = comp.get("name", "hermes") if isinstance(comp, dict) else "hermes"
+    ok(f"Computer: {name} ({cid})")
+
+    u = ensure_public_url(key, cid, port, args.label, f"{name}-web")
+    public_url = u["url"].rstrip("/")
+
+    info("Building the Webapp (the first build can take a few minutes)...")
+    run([hermes, "webapp", "--build-only"], timeout=1800, check=True)
+    ok("Webapp bundle is built")
+
+    reg_changed = register_webapp_sign_in(hermes, f"{public_url}/auth/callback")
+    ok("Registered the Webapp's Nous sign-in for this URL" if reg_changed
+       else "Webapp's Nous sign-in already registered for this URL")
+
+    changed = reg_changed
+    # host 0.0.0.0: Orgo's proxy dials the computer's own address, so a loopback bind answers 502.
+    # A public bind always requires sign-in; public_url pins the https callback and allowed Host.
+    for k, v in (("webapp.host", "0.0.0.0"), ("webapp.port", str(port)), ("webapp.public_url", public_url)):
+        changed |= config_set(hermes, k, v, config_get(hermes, k))
+    proxies = config_list(hermes, "dashboard.trusted_proxies")
+    seen = probe_proxy(public_url, port)
+    merged = merge_proxies(proxies, seen)
+    if merged != proxies:
+        run([hermes, "config", "set", "dashboard.trusted_proxies", json.dumps(merged)], timeout=60, check=True)
+        changed = True
+        ok(f"Trusting Orgo's proxy ({', '.join(sorted(seen))}) for HTTPS headers")
+    elif not seen and not proxies:
+        warn("Couldn't see Orgo's proxy address; sign-in still works, but cookies won't be marked Secure.")
+    changed |= config_set(hermes, "webapp.enabled", "true", config_get(hermes, "webapp.enabled").lower())
+
+    serving = webapp_serving(hermes)
+    restart = None
+    if changed or not serving or args.restart:
+        if args.no_restart:
+            warn("The gateway reads these settings when it starts. Restart it to serve the Webapp.")
+        else:
+            defer = inside_agent()
+            restart = restart_gateway(hermes, defer=defer)
+            if restart == "scheduled":
+                ok(f"Gateway restart scheduled in {RESTART_DELAY}s (this runs inside the agent it restarts)")
+            else:
+                ok("Gateway restarted to serve the Webapp")
+    else:
+        ok("Gateway already serves the Webapp with these settings (left untouched)")
+
+    healthy = None
+    if restart != "scheduled" and not (args.no_restart and (changed or not serving)):
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            code, loc = public_sign_in_check(public_url)
+            if sign_in_gated(code, loc):
+                healthy = True
+                break
+            time.sleep(4)
+        if healthy:
+            ok("Public URL answers with the Nous sign-in")
+        else:
+            warn(f"{public_url} isn't showing the sign-in yet (last HTTP {code}). "
+                 "Check `hermes webapp --status` and `orgo-hermes-connect status --webapp`.")
+
+    state = load_state()
+    state["webapp"] = {"computer_id": cid, "url_id": u["id"], "url": public_url, "port": port}
+    save_state(state)
+
+    print("\n  " + "─" * 60)
+    print(f"  Hermes Webapp URL:  {public_url}")
+    print("  " + "─" * 60)
+    print("  Open it in any browser and sign in with the Nous account this Hermes is signed in to.")
+    if restart == "scheduled":
+        print(f"  It goes live after the gateway restart in ~{RESTART_DELAY}s; chat, Telegram and other")
+        print("  channels drop for a few seconds while it restarts.")
+    print()
+    if args.json:
+        print(json.dumps({"url": public_url, "webapp": True, "computer_id": cid, "restart": restart}))
+    return 0 if healthy is not False else 1
+
+
+def cmd_web_status(args) -> int:
+    hermes = hermes_bin()
+    url = load_state().get("webapp", {}).get("url") or config_get(hermes, "webapp.public_url") or None
+    status = run([hermes, "webapp", "--status"], timeout=60).stdout.strip()
+    code, loc = public_sign_in_check(url) if url else (0, "")
+    data = {"url": url, "gateway": status.splitlines()[0] if status else None,
+            "public_http": code, "sign_in_required": sign_in_gated(code, loc)}
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        for k, v in data.items():
+            print(f"  {k:17} {v}")
+    return 0 if status.startswith("Serving at") and data["sign_in_required"] else 1
+
+
+def cmd_web_down(args) -> int:
+    hermes = hermes_bin()
+    state = load_state()
+    web = state.get("webapp", {})
+    if config_set(hermes, "webapp.enabled", "false", config_get(hermes, "webapp.enabled").lower()):
+        ok("Webapp turned off in config")
+        if not args.no_restart:
+            how = restart_gateway(hermes, defer=inside_agent())
+            ok("Gateway restart scheduled" if how == "scheduled" else "Gateway restarted")
+    if web.get("url_id") and not args.keep_url:
+        key = ensure_orgo_key(interactive=False)
+        code, resp = http("DELETE", f"{ORGO_API}/computers/{web['computer_id']}/public-urls/{web['url_id']}", token=key)
+        if code in (200, 204, 404):
+            ok(f"Deleted public URL {web.get('url')}")
+            state.pop("webapp", None)
+        else:
+            warn(f"Could not delete public URL: {api_error(resp)}")
+    save_state(state)
+    info("To revoke the Webapp's Nous sign-in client: https://portal.nousresearch.com/local-dashboards")
+    return 0
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_up(args) -> int:
+    if args.webapp:
+        return cmd_web_up(args)
+    args.port = args.port or DEFAULT_PORT
     if args.port in RESERVED_PORTS:
         raise Fail(f"Port {args.port} is reserved by Orgo; pick another (default {DEFAULT_PORT}).")
     print(f"\norgo-hermes-connect {__version__}\n")
@@ -616,6 +916,8 @@ def cmd_up(args) -> int:
 
 
 def cmd_status(args) -> int:
+    if args.webapp:
+        return cmd_web_status(args)
     state = load_state()
     url = state.get("url")
     port = state.get("port", DEFAULT_PORT)
@@ -651,6 +953,8 @@ def cmd_url(args) -> int:
 
 
 def cmd_down(args) -> int:
+    if args.webapp:
+        return cmd_web_down(args)
     state = load_state()
     stop_backend(force=args.force)
     ok("Backend stopped")
@@ -678,7 +982,13 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("up", help="Create/reuse the URL, configure login, start the backend")
     up.add_argument("--auth", choices=["nous", "password", "oidc"], default=os.environ.get("OHC_AUTH", "nous"),
                     help="Login provider for the public URL (default: nous)")
-    up.add_argument("--port", type=int, default=DEFAULT_PORT)
+    up.add_argument("--webapp", action="store_true",
+                    help="Publish the Hermes Webapp (Desktop in a browser, Hermes 0.23+) instead of the "
+                         "Desktop gateway")
+    up.add_argument("--port", type=int, default=None,
+                    help=f"Local port (default {DEFAULT_PORT}; {WEBAPP_PORT} with --webapp)")
+    up.add_argument("--no-restart", action="store_true",
+                    help="--webapp: save the settings but leave the gateway restart to you")
     up.add_argument("--label", help="URL label -> https://<label>.orgo.dev (default: <computer-name>-<4 hex>)")
     up.add_argument("--computer-id", help="Orgo computer id (auto-detected on Orgo's Hermes template)")
     up.add_argument("--name", help="Name for the Nous dashboard registration")
@@ -694,10 +1004,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("status", help="Show URL, backend and login state (exit 1 if unhealthy)")
     st.add_argument("--json", action="store_true")
+    st.add_argument("--webapp", action="store_true", help="Show the Webapp's URL and sign-in state")
     sub.add_parser("url", help="Print the gateway URL")
     dn = sub.add_parser("down", help="Stop the backend and delete the public URL")
     dn.add_argument("--keep-url", action="store_true", help="Stop the backend but keep the URL reserved")
     dn.add_argument("--force", action="store_true", help="Also remove a hermes-serve service this tool didn't create")
+    dn.add_argument("--webapp", action="store_true", help="Turn the Webapp off and delete its URL")
+    dn.add_argument("--no-restart", action="store_true", help="--webapp: leave the gateway restart to you")
     return p
 
 
