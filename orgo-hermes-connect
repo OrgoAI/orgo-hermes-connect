@@ -248,12 +248,29 @@ def ensure_orgo_key(interactive: bool = True) -> str:
 
 # ── computer detection ──────────────────────────────────────────────────────
 
+def metadata_computer_id(timeout: float = 3) -> str | None:
+    """This computer's id from Orgo's metadata service (no key needed; Linux Orgo computers).
+    Bypasses any proxy: the service refuses proxied requests."""
+    req = urllib.request.Request("http://169.254.169.254/orgo/v1/identity", headers={"Metadata-Flavor": "Orgo"})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as resp:
+            ident = json.loads(resp.read().decode() or "{}")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    cid = ident.get("desktop_id") if isinstance(ident, dict) else None
+    return cid if isinstance(cid, str) and UUID_RE.fullmatch(cid) else None
+
+
 def detect_computer_id(key: str, explicit: str | None) -> str:
     if explicit:
         return explicit
     for name in ("ORGO_COMPUTER_ID", "COMPUTER_ID"):
         if v := get_secret(name):
             return v
+    # Orgo's metadata service knows which computer this is. Template computers created without an
+    # Orgo MCP entry (e.g. system/hermes-agent@1.1.16) have nothing else to go on.
+    if cid := metadata_computer_id():
+        return cid
     # Orgo's Hermes template wires an MCP server at .../mcp/computers/<id> into config.yaml.
     cfg = HERMES_HOME / "config.yaml"
     if cfg.exists():

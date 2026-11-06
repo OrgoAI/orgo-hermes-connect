@@ -178,6 +178,27 @@ class GatewayRestartSafetyTests(unittest.TestCase):
 
 
 class DetectTests(unittest.TestCase):
+    def setUp(self):
+        self.saved_meta = ohc.metadata_computer_id
+        ohc.metadata_computer_id = lambda timeout=3: None   # never reach a real metadata service
+
+    def tearDown(self):
+        ohc.metadata_computer_id = self.saved_meta
+
+    def test_detect_from_metadata_service(self):
+        env_backup = {k: os.environ.pop(k, None) for k in ("ORGO_COMPUTER_ID", "COMPUTER_ID")}
+        old_env_file, old_home = ohc.ENV_FILE, ohc.HERMES_HOME
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                ohc.ENV_FILE, ohc.HERMES_HOME = Path(d) / ".env", Path(d)
+                ohc.metadata_computer_id = lambda timeout=3: "fdf89e52-48f4-4092-be22-f6a25e2daa31"
+                self.assertEqual(ohc.detect_computer_id("k", None), "fdf89e52-48f4-4092-be22-f6a25e2daa31")
+        finally:
+            ohc.ENV_FILE, ohc.HERMES_HOME = old_env_file, old_home
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
     def test_detect_from_config_yaml(self):
         with tempfile.TemporaryDirectory() as d:
             old = ohc.HERMES_HOME
