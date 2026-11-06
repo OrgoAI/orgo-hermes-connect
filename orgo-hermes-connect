@@ -344,6 +344,20 @@ def nous_logged_in(hermes: str) -> bool:
     return "logged in" in (p.stdout + p.stderr).lower() and "logged out" not in (p.stdout + p.stderr).lower()
 
 
+def ensure_nous_login(hermes: str, args, why: str) -> None:
+    """Sign this Hermes in to Nous through a device code when it isn't (the person approves a link)."""
+    if nous_logged_in(hermes):
+        return
+    if args.non_interactive:
+        raise Fail(f"Not signed in to Nous ({why}). Run without --non-interactive, or "
+                   "`hermes auth add nous --type oauth --no-browser` first.")
+    info(f"Signing this Hermes install in to Nous Portal ({why}).")
+    info("Follow the link and code below:\n")
+    p = subprocess.run([hermes, "auth", "add", "nous", "--type", "oauth", "--no-browser"], timeout=900)
+    if p.returncode != 0 or not nous_logged_in(hermes):
+        raise Fail("Nous sign-in did not complete.")
+
+
 def configure_auth(hermes: str, mode: str, public_url: str, args) -> dict:
     """Configure the dashboard login provider. Returns info to print; result['changed'] says
     whether ~/.hermes/.env changed (the backend only reads it at startup)."""
@@ -351,14 +365,7 @@ def configure_auth(hermes: str, mode: str, public_url: str, args) -> dict:
     result: dict = {"mode": mode}
     callback = f"{public_url}/auth/callback"
     if mode == "nous":
-        if not nous_logged_in(hermes):
-            if args.non_interactive:
-                raise Fail("Not signed in to Nous. Run `hermes auth add nous --type oauth --no-browser` first.")
-            info("Signing this Hermes install in to Nous Portal (needed to register the dashboard login).")
-            info("Follow the link and code below:\n")
-            p = subprocess.run([hermes, "auth", "add", "nous", "--type", "oauth", "--no-browser"], timeout=900)
-            if p.returncode != 0 or not nous_logged_in(hermes):
-                raise Fail("Nous sign-in did not complete.")
+        ensure_nous_login(hermes, args, "needed to register the dashboard login")
         state = load_state()
         already = env.get("HERMES_DASHBOARD_OAUTH_CLIENT_ID") and (
             env.get("HERMES_DASHBOARD_PUBLIC_URL") == public_url or state.get("registered_for") == public_url)
@@ -730,10 +737,9 @@ def cmd_web_up(args) -> int:
     print(f"\norgo-hermes-connect {__version__}: Webapp\n")
     hermes = hermes_bin()
     if run([hermes, "webapp", "--help"], timeout=60).returncode != 0:
-        raise Fail("This Hermes has no Webapp (needs Hermes 0.23+). Run `hermes update` first.")
-    if not nous_logged_in(hermes):
-        raise Fail("The Webapp's sign-in needs this Hermes signed in to Nous: "
-                   "run `hermes auth add nous --type oauth --no-browser` first.")
+        raise Fail("This Hermes has no Webapp (needs Hermes 0.23+; Orgo's template may ship older). "
+                   "Run `hermes update` first, then `supervisorctl restart hermes-gateway`.")
+    ensure_nous_login(hermes, args, "the Webapp's sign-in is registered under it")
     key = ensure_orgo_key(interactive=not args.non_interactive)
     cid = detect_computer_id(key, args.computer_id)
     code, comp = http("GET", f"{ORGO_API}/computers/{cid}", token=key)
