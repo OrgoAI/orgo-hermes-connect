@@ -58,6 +58,49 @@ Re-running `up` is safe. It reuses the URL and login, and **it never restarts a 
 backend unless a setting it depends on changed.** If it finds a `hermes-serve` service it didn't
 create, it uses that service as-is.
 
+## Webapp: Hermes Desktop in any browser
+
+Hermes 0.23+ ships the **Webapp**: the full Desktop workspace (sessions, files, Git review, terminal,
+bot screen) in a normal browser tab, no app install. Hermes serves it but leaves the public HTTPS
+address to you ("an HTTPS address you already run"). On Orgo that's one command:
+
+```bash
+orgo-hermes-connect up --webapp
+```
+
+```
+  ✓ Orgo API key works
+  ✓ Computer: Hermes Agent (7f388be6-…)
+  ✓ Reusing public URL https://doug-web.orgo.dev -> :9120
+  ✓ Webapp bundle is built
+  ✓ Webapp's Nous sign-in already registered for this URL
+  ✓ Gateway already serves the Webapp with these settings (left untouched)
+  ✓ Public URL answers with the Nous sign-in
+
+  Hermes Webapp URL:  https://doug-web.orgo.dev
+```
+
+(A re-run on a computer that already has it. A first run also prints the new URL, the sign-in
+registration, the trusted proxy and the gateway restart.)
+
+It creates `https://<computer-name>-web-<4 hex>.orgo.dev` → port 9120, builds the Webapp, registers
+its Nous sign-in for that URL, sets `webapp.enabled`, `webapp.host: 0.0.0.0` (Orgo's proxy can't
+reach loopback), `webapp.public_url` and `dashboard.trusted_proxies` (Orgo's proxy address, found by
+probing, so sign-in cookies are `Secure`) through `hermes config set`, then restarts the gateway and
+checks that the URL answers with the sign-in. Open the URL anywhere and sign in with the Nous account
+this Hermes is signed in to.
+
+- **The gateway restart.** The Webapp is served by the Hermes *gateway*, the same process that runs
+  chat, Telegram and the other channels, and it reads these settings only at start. When an agent
+  runs this command in its own terminal, restarting inline would kill the agent mid-turn, so the
+  tool schedules the restart 30 s out in a detached session instead. Channels drop for a few seconds.
+  `--no-restart` saves everything and leaves the restart to you.
+- **It doesn't touch the Desktop gateway.** The Webapp's sign-in is a separate Nous client
+  (`~/.hermes/webapp/sign-in-registration.json`), never `HERMES_DASHBOARD_OAUTH_CLIENT_ID`, so the
+  `up` URL on 9119 keeps working. Re-running is safe: nothing changed means no restart.
+- A signed-in Webapp user can run commands on the computer, the same as the Desktop app. Keep the Nous
+  sign-in; never put it behind password auth on a public URL.
+
 ## Commands
 
 | Command | |
@@ -66,6 +109,8 @@ create, it uses that service as-is.
 | `orgo-hermes-connect status [--json]` | URL, backend and login state; exits 1 if unhealthy |
 | `orgo-hermes-connect url` | Print just the URL |
 | `orgo-hermes-connect down [--keep-url]` | Stop the backend and delete the URL |
+| `orgo-hermes-connect up --webapp` | Publish the Hermes Webapp (the Desktop app in a browser), see below |
+| `orgo-hermes-connect status --webapp` / `down --webapp` | Its status; turn it off and delete its URL |
 
 `up` options:
 
@@ -73,11 +118,13 @@ create, it uses that service as-is.
 |---|---|---|
 | `--auth nous\|password\|oidc` | `nous` | Login provider (see below) |
 | `--label NAME` | `<computer-name>-<4 hex>` | URL becomes `https://NAME.orgo.dev` |
-| `--port N` | `9119` | Local port for `hermes serve` |
+| `--port N` | `9119` (`9120` with `--webapp`) | Local port |
 | `--computer-id UUID` | auto | Orgo computer id |
 | `--non-interactive` | | Fail instead of waiting for approvals (for scripts and agents) |
 | `--restart` | | Restart the backend even when nothing changed |
 | `--force` | | Take over a `hermes-serve` service this tool didn't create |
+| `--webapp` | | Publish the Webapp (port 9120) instead of the Desktop gateway |
+| `--no-restart` | | With `--webapp`: save settings, leave the gateway restart to you |
 
 ## Login options
 
@@ -114,6 +161,7 @@ create, it uses that service as-is.
 | `Not signed in to Nous` with `--non-interactive` | Run without `--non-interactive` once and approve the Nous device code |
 | Backend won't start | `supervisorctl tail hermes-serve stderr` |
 | Port 8642 vs 9119 | 8642 is Hermes' OpenAI-compatible API server. The desktop app connects to `hermes serve` on **9119** |
+| Webapp URL shows Orgo's 502 "Nothing is answering on port 9120" | The gateway hasn't restarted onto the Webapp settings yet. `hermes webapp --status` says so; wait for the scheduled restart, or restart the gateway (on Orgo: Settings → Hermes → Repair) |
 
 ## Making this the default on Orgo
 

@@ -1,7 +1,7 @@
 ---
 name: orgo-hermes-connect
-description: "Use when connecting Hermes Desktop to an agent on Orgo."
-version: 0.1.0
+description: "Use when connecting Hermes Desktop or its browser Webapp to an agent on Orgo."
+version: 0.2.0
 author: Orgo
 license: MIT
 metadata:
@@ -47,6 +47,17 @@ Settings -> Gateways -> Remote gateway**. Logging in is required (Nous Portal by
 
 Options for `up`: `--auth nous|password|oidc`, `--label NAME`, `--port N`,
 `--computer-id UUID`, `--oidc-issuer/--oidc-client-id`, `--rotate-password`, `--reregister`.
+
+## Webapp (Desktop in a browser, Hermes 0.23+)
+When the user wants Hermes "on the web" / "in a browser" / "without the app":
+1. `orgo-hermes-connect up --webapp --non-interactive` (needs this Hermes signed in to Nous).
+   It makes `<name>-web-xxxx.orgo.dev` -> :9120, builds the Webapp, registers its own Nous sign-in,
+   sets the `webapp:` config and trusted proxy, and restarts the gateway.
+2. Run from your own terminal, the gateway restart is **scheduled 30 s out** (the gateway is the
+   process running you). Send the URL in that reply and tell the user channels drop for a few
+   seconds; they sign in with the Nous account this Hermes uses.
+3. Verify afterwards: `orgo-hermes-connect status --webapp` exits 0 when the gateway serves it and
+   the URL redirects to the Nous sign-in. An Orgo 502 on :9120 means the restart hasn't happened.
 
 ## Pitfalls
 - `--auth password` is a single shared credential. Hermes recommends it only for trusted

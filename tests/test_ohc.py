@@ -73,13 +73,132 @@ class HashTests(unittest.TestCase):
 class ParserTests(unittest.TestCase):
     def test_defaults(self):
         a = ohc.build_parser().parse_args(["up"])
-        self.assertEqual((a.auth, a.port), ("nous", 9119))
+        self.assertEqual((a.auth, a.port, a.webapp), ("nous", None, False))
 
     def test_reserved_port_rejected(self):
         self.assertEqual(ohc.main(["up", "--port", "8080"]), 1)
 
+    def test_reserved_port_rejected_for_webapp(self):
+        self.assertEqual(ohc.main(["up", "--webapp", "--port", "8080"]), 1)
+
+    def test_webapp_flags(self):
+        a = ohc.build_parser().parse_args(["up", "--webapp", "--no-restart"])
+        self.assertTrue(a.webapp and a.no_restart)
+        self.assertTrue(ohc.build_parser().parse_args(["status", "--webapp"]).webapp)
+        self.assertTrue(ohc.build_parser().parse_args(["down", "--webapp"]).webapp)
+
+
+RUNTIME = json.dumps([
+    "/opt/py/bin/python3", "-I", "-c",
+    "import os, sys, runpy; sys.path.insert(0, '/opt/hermes'); import hermes_bootstrap; "
+    "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"])
+
+
+class WebappTests(unittest.TestCase):
+    def test_register_command_swaps_only_the_entry_point(self):
+        cmd = ohc.register_command(RUNTIME)
+        self.assertEqual(cmd[:3], ["/opt/py/bin/python3", "-I", "-c"])
+        self.assertIn("import hermes_bootstrap", cmd[-1])
+        self.assertNotIn("run_module", cmd[-1])
+        self.assertIn("webapp_access", cmd[-1])
+        # The callback comes from the environment, never spliced into the code.
+        self.assertIn("os.environ['OHC_WEBAPP_CALLBACK']", cmd[-1])
+        self.assertNotIn("orgo.dev", cmd[-1])
+
+    def test_register_command_refuses_unknown_runtime(self):
+        for bad in ("", "not json", json.dumps(["python3", "-m", "hermes_cli.main"])):
+            with self.assertRaises(ohc.Fail):
+                ohc.register_command(bad)
+
+    def test_merge_proxies_keeps_existing_and_adds_new(self):
+        self.assertEqual(ohc.merge_proxies(["10.0.0.9"], {"10.200.1.2"}), ["10.0.0.9", "10.200.1.2"])
+        self.assertEqual(ohc.merge_proxies(["10.200.1.2"], {"10.200.1.2"}), ["10.200.1.2"])
+        self.assertEqual(ohc.merge_proxies([], set()), [])
+
+    def test_sign_in_gated(self):
+        self.assertTrue(ohc.sign_in_gated(302, "https://x.orgo.dev/auth/login?provider=nous&next=%2F"))
+        self.assertTrue(ohc.sign_in_gated(401, ""))
+        self.assertFalse(ohc.sign_in_gated(200, ""))     # an open Webapp is not healthy
+        self.assertFalse(ohc.sign_in_gated(502, ""))
+        self.assertFalse(ohc.sign_in_gated(302, "https://elsewhere.example/"))
+
+    def test_config_list_parses_yaml_list_output(self):
+        saved = ohc.run
+        try:
+            import subprocess
+            ohc.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "  - 10.200.187.241\n  - '10.0.0.0/24'\n", "")
+            self.assertEqual(ohc.config_list("hermes", "dashboard.trusted_proxies"),
+                             ["10.200.187.241", "10.0.0.0/24"])
+            ohc.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "[]\n", "")
+            self.assertEqual(ohc.config_list("hermes", "dashboard.trusted_proxies"), [])
+        finally:
+            ohc.run = saved
+
+    def test_inside_agent_detection(self):
+        saved = {k: os.environ.pop(k, None) for k in ("HERMES_SESSION_ID", "HERMES_AGENT")}
+        try:
+            self.assertFalse(ohc.inside_agent())
+            os.environ["HERMES_SESSION_ID"] = "s1"
+            self.assertTrue(ohc.inside_agent())
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+
+class GatewayRestartSafetyTests(unittest.TestCase):
+    """Restarting the gateway kills the agent running this tool, so from inside an agent it must be
+    deferred into its own session and never run inline."""
+
+    def setUp(self):
+        import subprocess
+        self.saved = (ohc.run, ohc.subprocess.Popen, ohc.shutil.which)
+        self.calls, self.spawned = [], []
+        ohc.run = lambda cmd, **kw: (self.calls.append(cmd) or
+                                     subprocess.CompletedProcess(cmd, 0, "hermes-gateway  RUNNING  pid 1", ""))
+        ohc.subprocess.Popen = lambda cmd, **kw: self.spawned.append((cmd, kw))
+        ohc.shutil.which = lambda name: "/usr/bin/" + name
+
+    def tearDown(self):
+        ohc.run, ohc.subprocess.Popen, ohc.shutil.which = self.saved
+
+    def test_deferred_restart_is_detached_and_not_inline(self):
+        self.assertEqual(ohc.restart_gateway("hermes", defer=True), "scheduled")
+        self.assertFalse(any(c[:2] == ["supervisorctl", "restart"] for c in self.calls))
+        (cmd, kw), = self.spawned
+        self.assertTrue(kw.get("start_new_session"))
+        self.assertIn("sleep 30", cmd[-1])
+        self.assertIn("supervisorctl restart hermes-gateway", cmd[-1])
+
+    def test_direct_restart_runs_inline(self):
+        self.assertEqual(ohc.restart_gateway("hermes", defer=False), "restarted")
+        self.assertIn(["supervisorctl", "restart", "hermes-gateway"], self.calls)
+        self.assertEqual(self.spawned, [])
+
 
 class DetectTests(unittest.TestCase):
+    def setUp(self):
+        self.saved_meta = ohc.metadata_computer_id
+        ohc.metadata_computer_id = lambda timeout=3: None   # never reach a real metadata service
+
+    def tearDown(self):
+        ohc.metadata_computer_id = self.saved_meta
+
+    def test_detect_from_metadata_service(self):
+        env_backup = {k: os.environ.pop(k, None) for k in ("ORGO_COMPUTER_ID", "COMPUTER_ID")}
+        old_env_file, old_home = ohc.ENV_FILE, ohc.HERMES_HOME
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                ohc.ENV_FILE, ohc.HERMES_HOME = Path(d) / ".env", Path(d)
+                ohc.metadata_computer_id = lambda timeout=3: "fdf89e52-48f4-4092-be22-f6a25e2daa31"
+                self.assertEqual(ohc.detect_computer_id("k", None), "fdf89e52-48f4-4092-be22-f6a25e2daa31")
+        finally:
+            ohc.ENV_FILE, ohc.HERMES_HOME = old_env_file, old_home
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
     def test_detect_from_config_yaml(self):
         with tempfile.TemporaryDirectory() as d:
             old = ohc.HERMES_HOME
